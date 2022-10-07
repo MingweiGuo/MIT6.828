@@ -55,6 +55,7 @@
 #define PDXSHIFT	22		// offset of PDX in a linear address
 
 // Page table/directory entry flags.
+// 状态标记位
 #define PTE_P		0x001	// Present
 #define PTE_W		0x002	// Writeable
 #define PTE_U		0x004	// User
