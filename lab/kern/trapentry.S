@@ -4,6 +4,7 @@
 #include <inc/memlayout.h>
 #include <inc/trap.h>
 
+#include <kern/picirq.h>
 
 
 ###################################################################
@@ -47,7 +48,7 @@
  * Lab 3: Your code here for generating entry points for the different traps.
  */
 
-// 无错误码
+/ 无错误码
 TRAPHANDLER_NOEC(handler_divide, T_DIVIDE)
 TRAPHANDLER_NOEC(handler_debug, T_DEBUG)
 TRAPHANDLER_NOEC(handler_nmi, T_NMI)

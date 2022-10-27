@@ -144,6 +144,7 @@ debuginfo_eip(uintptr_t addr, struct Eipdebuginfo *info)
 		// LAB 3: Your code here.
 		if(user_mem_check(curenv,(void *)usd, sizeof(struct UserStabData), PTE_U)<0)
 			return -1;
+
 		stabs = usd->stabs;
 		stab_end = usd->stab_end;
 		stabstr = usd->stabstr;

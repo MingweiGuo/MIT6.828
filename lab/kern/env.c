@@ -11,9 +11,11 @@
 #include <kern/pmap.h>
 #include <kern/trap.h>
 #include <kern/monitor.h>
+#include <kern/sched.h>
+#include <kern/cpu.h>
+#include <kern/spinlock.h>
 
 struct Env *envs = NULL;		// All environments
-struct Env *curenv = NULL;		// The current env
 static struct Env *env_free_list;	// Free environment list
 					// (linked by Env->env_link)
 
@@ -34,7 +36,7 @@ static struct Env *env_free_list;	// Free environment list
 // definition of gdt specifies the Descriptor Privilege Level (DPL)
 // of that descriptor: 0 for kernel and 3 for user.
 //
-struct Segdesc gdt[] =
+struct Segdesc gdt[NCPU + 5] =
 {
 	// 0x0 - unused (always faults -- for trapping NULL far pointers)
 	SEG_NULL,
@@ -51,7 +53,8 @@ struct Segdesc gdt[] =
 	// 0x20 - user data segment
 	[GD_UD >> 3] = SEG(STA_W, 0x0, 0xffffffff, 3),
 
-	// 0x28 - tss, initialized in trap_init_percpu()
+	// Per-CPU TSS descriptors (starting from GD_TSS0) are initialized
+	// in trap_init_percpu()
 	[GD_TSS0 >> 3] = SEG_NULL
 };
 
@@ -116,10 +119,8 @@ env_init(void)
 {
 	// Set up envs array
 	// LAB 3: Your code here.
-	int i;
 	env_free_list = NULL;
-
-	for(i = NENV-1; i >= 0; --i){
+	for(int i = NENV - 1; i >= 0; --i){
 		envs[i].env_id = 0;
 		envs[i].env_status = ENV_FREE;
 		envs[i].env_link = env_free_list;
@@ -127,7 +128,7 @@ env_init(void)
 	}
 
 	// Per-CPU part of the initialization
-	env_init_percpu();	
+	env_init_percpu();
 }
 
 // Load GDT and segment descriptors.
@@ -188,20 +189,9 @@ env_setup_vm(struct Env *e)
 	//    - The functions in kern/pmap.h are handy.
 
 	// LAB 3: Your code here.
-
-	// 1) p->pp_ref++ 引用+1
-	++ p->pp_ref;
-	
-	//2)
-	// env_pgdir:
-    // This variable holds the kernel virtual address of 
-	// this environment's page directory.
-	e->env_pgdir = (pde_t *)page2kva(p);
-
-	//3) 内存映射
-	memcpy(e->env_pgdir,kern_pgdir,PGSIZE);
-	
-
+	p->pp_ref++;
+	e->env_pgdir = page2kva(p);
+	memcpy(e->env_pgdir, kern_pgdir, PGSIZE);
 
 	// UVPT maps the env's own page table read-only.
 	// Permissions: kernel R, user R
@@ -265,6 +255,15 @@ env_alloc(struct Env **newenv_store, envid_t parent_id)
 	e->env_tf.tf_cs = GD_UT | 3;
 	// You will set e->env_tf.tf_eip later.
 
+	// Enable interrupts while in user mode.
+	// LAB 4: Your code here.
+
+	// Clear the page fault handler until user installs one.
+	e->env_pgfault_upcall = 0;
+
+	// Also clear the IPC receiving flag.
+	e->env_ipc_recving = 0;
+
 	// commit the allocation
 	env_free_list = e->env_link;
 	*newenv_store = e;
@@ -273,7 +272,7 @@ env_alloc(struct Env **newenv_store, envid_t parent_id)
 	return 0;
 }
 
-// 为env分配物理空间
+//
 // Allocate len bytes of physical memory for environment env,
 // and map it at virtual address va in the environment's address space.
 // Does not zero or otherwise initialize the mapped pages in any way.
@@ -290,22 +289,13 @@ region_alloc(struct Env *e, void *va, size_t len)
 	//   'va' and 'len' values that are not page-aligned.
 	//   You should round va down, and round (va + len) up.
 	//   (Watch out for corner-cases!)
-
-	struct PageInfo* page = NULL;
-	// 1) 取下界
-	va = ROUNDDOWN(va,PGSIZE);
-	// 2) 取上界限
-	void *va_end = (void *)ROUNDUP(va + len,PGSIZE);
-
-	//3) 映射page
-	for(; va < va_end; va += PGSIZE){
-		// Allocate a page for the page directory
-		if (!(page = page_alloc(ALLOC_ZERO))){
-			panic("region_alloc: page_alloc falied.");
-		}
-		if(page_insert(e->env_pgdir, page, va, PTE_U | PTE_W)){
-			panic("region_alloc: page_insert(page mapping) falied.");
-		}
+	void* end = ROUNDUP(va + len, PGSIZE);
+	for(void* i = ROUNDDOWN(va, PGSIZE); i < end; i+= PGSIZE) {
+		struct PageInfo *p = NULL;
+		assert(p = page_alloc(0));
+		
+		int result = page_insert(e->env_pgdir, p, i, PTE_W | PTE_U);
+		assert(result >= 0);
 	}
 }
 
@@ -362,54 +352,40 @@ load_icode(struct Env *e, uint8_t *binary)
 	//  to make sure that the environment starts executing there.
 	//  What?  (See env_run() and env_pop_tf() below.)
 
-	// LAB 3: Your code here.
+// LAB 3: Your code here.
+	struct Elf *elf = (struct Elf *)binary;
+	assert(elf->e_magic == ELF_MAGIC);
 
-	// 1) 将二进制转化为Elf
-	struct Elf *elf_header = (struct Elf* )binary;
-
-	// 2) 检验ELF合法性
-	if (elf_header->e_magic != ELF_MAGIC){
-		panic("load_icode failed: illegal ELF format!");
-	}
-
-	// 3）转换到用户态空间
-	lcr3(PADDR(e->env_pgdir));
-
-	// 4)load each program segment
 	struct Proghdr *ph, *eph;
-
-	ph = (struct Proghdr *) ((uint8_t *) binary + elf_header->e_phoff);
-	eph = ph + elf_header->e_phnum;
-
+	ph = (struct Proghdr *) ((uint8_t *) elf + elf->e_phoff);
+	eph = ph + elf->e_phnum;
 	for (; ph < eph; ph++){
-		if(ph->p_type == ELF_PROG_LOAD){
-			region_alloc(e, (void *)ph->p_va, ph->p_memsz);
-			//  The ph->p_filesz bytes from the ELF binary, starting at
-			//  'binary + ph->p_offset', should be copied to virtual address
-			//  ph->p_va.
-			memmove((void *)ph->p_va, binary + ph->p_offset, ph->p_filesz);
-			memset((void *)(ph->p_va + ph->p_filesz), 0, ph->p_memsz - ph->p_filesz);
-		}
-	}	
-
-	// 4) 函数入口
-	e->env_tf.tf_eip = elf_header->e_entry;
-	lcr3(PADDR(kern_pgdir));
-
-	// 5) 映射程序 内核栈
-
-	region_alloc(e, (void *)(USTACKTOP - PGSIZE), PGSIZE);
-
+		// cprintf("segment: filesz %x memsz %x va %x pa %x offset %x flags %x\n",ph->p_filesz, ph->p_memsz, ph->p_va, ph->p_pa, ph->p_offset, ph->p_flags);
+		
+		if(ph->p_type != ELF_PROG_LOAD)
+			continue;
+		assert(ph->p_memsz >= ph->p_filesz);
+		
+		region_alloc(e, (void*)ph->p_va, ph->p_memsz);
+		lcr3(PADDR(e->env_pgdir));
+		memset((void*)ph->p_va, 0, ph->p_memsz);
+		memcpy((void*)ph->p_va, (void*)elf + ph->p_offset, ph->p_filesz);
+		lcr3(PADDR(kern_pgdir));
+	}
+	// cprintf("finish load segment\n");
 	// Now map one page for the program's initial stack
 	// at virtual address USTACKTOP - PGSIZE.
 
 	// LAB 3: Your code here.
+	region_alloc(e, (void*)USTACKTOP - PGSIZE, PGSIZE);
+	e->env_tf.tf_esp = USTACKTOP;
+	e->env_tf.tf_eip = elf->e_entry;
 }
 
 //
 // Allocates a new env with env_alloc, loads the named elf
 // binary into it with load_icode, and sets its env_type.
-// This function is ONLY called during kernel 
+// This function is ONLY called during kernel initialization,
 // before running the first user-mode environment.
 // The new env's parent ID is set to 0.
 //
@@ -417,16 +393,16 @@ void
 env_create(uint8_t *binary, enum EnvType type)
 {
 	// LAB 3: Your code here.
-	
 	// 1) 重新分配一个 env
-	struct Env *e = NULL;
+	struct Env *e;
 
-	if(env_alloc(&e, 0)){
-		panic("env_create: env_alloc failed.");
+	int r = env_alloc(&e, 0);
+	if (r < 0) {
+		panic("env_alloc: %e", r);
 	}
 
-	load_icode(e,binary);
-	e->env_status = type;
+	load_icode(e, binary);
+	e->env_type = type;
 }
 
 //
@@ -484,15 +460,26 @@ env_free(struct Env *e)
 
 //
 // Frees environment e.
+// If e was the current env, then runs a new environment (and does not return
+// to the caller).
 //
 void
 env_destroy(struct Env *e)
 {
+	// If e is currently running on other CPUs, we change its state to
+	// ENV_DYING. A zombie environment will be freed the next time
+	// it traps to the kernel.
+	if (e->env_status == ENV_RUNNING && curenv != e) {
+		e->env_status = ENV_DYING;
+		return;
+	}
+
 	env_free(e);
 
-	cprintf("Destroyed the only environment - nothing more to do!\n");
-	while (1)
-		monitor(NULL);
+	if (curenv == e) {
+		curenv = NULL;
+		sched_yield();
+	}
 }
 
 
@@ -505,6 +492,9 @@ env_destroy(struct Env *e)
 void
 env_pop_tf(struct Trapframe *tf)
 {
+	// Record the CPU we are running on for user-space debugging
+	curenv->env_cpunum = cpunum();
+
 	asm volatile(
 		"\tmovl %0,%%esp\n"
 		"\tpopal\n"
@@ -544,19 +534,19 @@ env_run(struct Env *e)
 
 	// LAB 3: Your code here.
 
-	// 1) 转换 enviroment
-	if(curenv && curenv->env_status == ENV_RUNNING){
+	if (curenv && curenv->env_status == ENV_RUNNING) {
 		curenv->env_status = ENV_RUNNABLE;
 	}
-
 	curenv = e;
-	curenv ->env_status = ENV_RUNNING;
-	++ curenv->env_runs;
-
-	//2)
+	curenv->env_status = ENV_RUNNING;
+	curenv->env_runs++;
 	lcr3(PADDR(curenv->env_pgdir));
+
+	// cprintf("start env_pop and running...\n");
+	unlock_kernel();
+	//cprintf("id %08x env_pop_tf eip %08x eax %d\n", curenv->env_id, curenv->env_tf.tf_eip, curenv->env_tf.tf_regs.reg_eax);
 	env_pop_tf(&curenv->env_tf);
 
-	// panic("env_run not yet implemented");
+	panic("env_run should not reach here");
 }
 
